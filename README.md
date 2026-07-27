@@ -1,2 +1,0 @@
-# pdfsplitter
-split pdf
