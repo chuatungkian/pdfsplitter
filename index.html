@@ -167,6 +167,14 @@
     .split-item { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 11px; background: #fff; border: 1px solid var(--line); border-radius: 10px; font-size: 13px; }
     .split-item strong { display: block; }
     .split-item span { color: var(--muted); font-size: 11px; }
+    .source-item { cursor: grab; user-select: none; transition: opacity .16s ease, transform .16s ease, border-color .16s ease, box-shadow .16s ease; }
+    .source-item:active { cursor: grabbing; }
+    .source-item.dragging { opacity: .45; transform: scale(.985); }
+    .source-item.drag-over { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    .source-main { min-width: 0; display: flex; align-items: center; gap: 9px; }
+    .drag-handle { flex: 0 0 auto; display: grid; place-items: center; width: 22px; height: 30px; color: #98a2b3; border-radius: 7px; }
+    .source-copy { min-width: 0; }
+    .source-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
     .viewer { position: relative; min-width: 0; padding: 22px; background: var(--soft); }
     .viewer-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 15px; }
@@ -259,7 +267,7 @@
     <main>
       <section class="hero">
         <div class="eyebrow">Private browser tool</div>
-        <h1>Merge and Split PDFs.</h1>
+        <h1>Merge PDFs. Split precisely.</h1>
         <p>Upload multiple PDFs in the order they should continue, merge them into one continuous document, then split the combined pages into a ZIP.</p>
       </section>
 
@@ -282,10 +290,10 @@
         <div class="workspace">
           <aside class="sidebar">
             <h2>Split settings</h2>
-            <p class="sidebar-copy">Your PDFs are merged in the order selected. Click page thumbnails to mark where an output document should end.</p>
+            <p class="sidebar-copy">Drag source files to change their merge order. Click page thumbnails to mark where an output document should end.</p>
 
             <label class="field-label">Merged source files</label>
-            <div class="split-list" id="sourceList"><div class="help">Uploaded PDFs will appear here in merge order.</div></div>
+            <div class="split-list" id="sourceList"><div class="help">Uploaded PDFs will appear here. Drag them to change the merge order.</div></div>
 
             <label class="field-label" for="rangeInput">Output page ranges</label>
             <input class="range-input" id="rangeInput" type="text" placeholder="e.g. 1-3, 4-7, 8-10" disabled />
@@ -400,44 +408,11 @@
       }
       if (validFiles.length !== files.length) toast('Non-PDF files were ignored.');
 
-      setLoading(`Merging ${validFiles.length} PDF${validFiles.length === 1 ? '' : 's'}…`);
+      state.files = validFiles;
+      state.breakAfter = new Set();
+      state.ranges = [];
       try {
-        const merged = await PDFLib.PDFDocument.create();
-        const sourceInfo = [];
-        let nextPage = 1;
-
-        for (const file of validFiles) {
-          const inputBytes = new Uint8Array(await file.arrayBuffer());
-          const source = await PDFLib.PDFDocument.load(inputBytes, { ignoreEncryption: false });
-          const count = source.getPageCount();
-          const copied = await merged.copyPages(source, source.getPageIndices());
-          copied.forEach(page => merged.addPage(page));
-          sourceInfo.push({ file, start: nextPage, end: nextPage + count - 1, count });
-          nextPage += count;
-        }
-
-        merged.setTitle(validFiles.length === 1 ? validFiles[0].name : 'Merged PDF');
-        merged.setCreator('PDF Splitter');
-        const bytes = new Uint8Array(await merged.save());
-        const pdfJsDoc = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
-
-        state.files = validFiles;
-        state.sourceInfo = sourceInfo;
-        state.bytes = bytes;
-        state.pdfJsDoc = pdfJsDoc;
-        state.pageCount = pdfJsDoc.numPages;
-        state.baseName = validFiles.length === 1 ? (sanitizeName(validFiles[0].name.replace(/\.pdf$/i, '')) || 'document') : 'merged-document';
-        state.breakAfter = new Set();
-        state.ranges = [{ start: 1, end: state.pageCount }];
-
-        const totalSize = validFiles.reduce((sum, file) => sum + file.size, 0);
-        el('fileName').textContent = validFiles.length === 1 ? validFiles[0].name : `${validFiles.length} PDFs merged`;
-        el('fileDetail').textContent = `${formatBytes(totalSize)} · ${state.pageCount} merged page${state.pageCount === 1 ? '' : 's'} · processed locally`;
-        el('pageCount').textContent = state.pageCount;
-        renderSourceList();
-        enableControls(true);
-        await renderPages();
-        syncFromBreaks();
+        await rebuildMergedPdf({ resetSplits: true });
         toast(`${validFiles.length} PDF${validFiles.length === 1 ? '' : 's'} merged successfully.`, 'success');
       } catch (error) {
         console.error(error);
@@ -446,16 +421,114 @@
       }
     }
 
+    async function rebuildMergedPdf({ resetSplits = false } = {}) {
+      const files = state.files;
+      if (!files.length) return;
+
+      setLoading(`Merging ${files.length} PDF${files.length === 1 ? '' : 's'}…`);
+      enableControls(false);
+      downloadBtn.disabled = true;
+
+      const merged = await PDFLib.PDFDocument.create();
+      const sourceInfo = [];
+      let nextPage = 1;
+
+      for (const file of files) {
+        const inputBytes = new Uint8Array(await file.arrayBuffer());
+        const source = await PDFLib.PDFDocument.load(inputBytes, { ignoreEncryption: false });
+        const count = source.getPageCount();
+        const copied = await merged.copyPages(source, source.getPageIndices());
+        copied.forEach(page => merged.addPage(page));
+        sourceInfo.push({ file, start: nextPage, end: nextPage + count - 1, count });
+        nextPage += count;
+      }
+
+      merged.setTitle(files.length === 1 ? files[0].name : 'Merged PDF');
+      merged.setCreator('PDF Splitter');
+      const bytes = new Uint8Array(await merged.save());
+      const pdfJsDoc = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
+
+      if (state.pdfJsDoc) await state.pdfJsDoc.destroy().catch(() => {});
+      state.sourceInfo = sourceInfo;
+      state.bytes = bytes;
+      state.pdfJsDoc = pdfJsDoc;
+      state.pageCount = pdfJsDoc.numPages;
+      state.baseName = files.length === 1 ? (sanitizeName(files[0].name.replace(/\.pdf$/i, '')) || 'document') : 'merged-document';
+      if (resetSplits) state.breakAfter = new Set();
+      state.breakAfter = new Set([...state.breakAfter].filter(page => page >= 1 && page < state.pageCount));
+
+      const totalSize = files.reduce((sum, file) => sum + file.size, 0);
+      el('fileName').textContent = files.length === 1 ? files[0].name : `${files.length} PDFs merged`;
+      el('fileDetail').textContent = `${formatBytes(totalSize)} · ${state.pageCount} merged page${state.pageCount === 1 ? '' : 's'} · processed locally`;
+      el('pageCount').textContent = state.pageCount;
+      renderSourceList();
+      enableControls(true);
+      await renderPages();
+      syncFromBreaks();
+    }
+
     function renderSourceList() {
       const list = el('sourceList');
       if (!state.sourceInfo.length) {
-        list.innerHTML = '<div class="help">Uploaded PDFs will appear here in merge order.</div>';
+        list.innerHTML = '<div class="help">Uploaded PDFs will appear here. Drag them to change the merge order.</div>';
         return;
       }
       list.innerHTML = state.sourceInfo.map((item, index) => {
         const pages = item.start === item.end ? `Merged page ${item.start}` : `Merged pages ${item.start}–${item.end}`;
-        return `<div class="split-item"><div><strong>${index + 1}. ${escapeHtml(item.file.name)}</strong><span>${pages}</span></div><span>${item.count} pg</span></div>`;
+        return `<div class="split-item source-item" draggable="true" data-index="${index}" aria-label="${escapeHtml(item.file.name)}, position ${index + 1} of ${state.sourceInfo.length}">
+          <div class="source-main">
+            <span class="drag-handle" aria-hidden="true"><svg width="15" height="19" viewBox="0 0 12 18" fill="currentColor"><circle cx="3" cy="3" r="1.25"/><circle cx="9" cy="3" r="1.25"/><circle cx="3" cy="9" r="1.25"/><circle cx="9" cy="9" r="1.25"/><circle cx="3" cy="15" r="1.25"/><circle cx="9" cy="15" r="1.25"/></svg></span>
+            <div class="source-copy"><strong>${index + 1}. ${escapeHtml(item.file.name)}</strong><span>${pages}</span></div>
+          </div>
+          <span>${item.count} pg</span>
+        </div>`;
       }).join('');
+      bindSourceReordering();
+    }
+
+    function bindSourceReordering() {
+      const list = el('sourceList');
+      let draggedIndex = null;
+
+      list.querySelectorAll('.source-item').forEach(item => {
+        item.addEventListener('dragstart', event => {
+          draggedIndex = Number(item.dataset.index);
+          item.classList.add('dragging');
+          event.dataTransfer.effectAllowed = 'move';
+          event.dataTransfer.setData('text/plain', String(draggedIndex));
+        });
+        item.addEventListener('dragend', () => {
+          draggedIndex = null;
+          list.querySelectorAll('.source-item').forEach(node => node.classList.remove('dragging', 'drag-over'));
+        });
+        item.addEventListener('dragover', event => {
+          event.preventDefault();
+          event.dataTransfer.dropEffect = 'move';
+          list.querySelectorAll('.source-item').forEach(node => node.classList.remove('drag-over'));
+          if (!item.classList.contains('dragging')) item.classList.add('drag-over');
+        });
+        item.addEventListener('dragleave', () => item.classList.remove('drag-over'));
+        item.addEventListener('drop', async event => {
+          event.preventDefault();
+          item.classList.remove('drag-over');
+          const from = draggedIndex ?? Number(event.dataTransfer.getData('text/plain'));
+          const to = Number(item.dataset.index);
+          if (!Number.isInteger(from) || !Number.isInteger(to) || from === to) return;
+
+          const reordered = [...state.files];
+          const [moved] = reordered.splice(from, 1);
+          reordered.splice(to, 0, moved);
+          state.files = reordered;
+
+          try {
+            await rebuildMergedPdf();
+            toast('Merge order updated.', 'success');
+          } catch (error) {
+            console.error(error);
+            toast('The PDFs could not be reordered. Please try again.', 'error');
+          }
+        });
+      });
     }
 
     async function renderPages() {
@@ -671,7 +744,7 @@
       enableControls(false);
       downloadBtn.disabled = true;
       el('splitList').innerHTML = '<div class="help">Your output files will appear here.</div>';
-      el('sourceList').innerHTML = '<div class="help">Uploaded PDFs will appear here in merge order.</div>';
+      el('sourceList').innerHTML = '<div class="help">Uploaded PDFs will appear here. Drag them to change the merge order.</div>';
       viewerContent.innerHTML = `
         <div class="drop-zone" id="dropZoneReset">
           <div>
