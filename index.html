@@ -267,7 +267,7 @@
     <main>
       <section class="hero">
         <div class="eyebrow">Private browser tool</div>
-        <h1>Merge and Split PDFs</h1>
+        <h1>Merge PDFs. Split precisely.</h1>
         <p>Upload multiple PDFs in the order they should continue, merge them into one continuous document, then split the combined pages into a ZIP.</p>
       </section>
 
@@ -284,6 +284,7 @@
               <svg width="17" height="17" viewBox="0 0 24 24" fill="none"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
               Download ZIP
             </button>
+            <a class="btn btn-secondary" id="manualDownloadLink" href="#" download style="display:none">Save generated ZIP</a>
           </div>
         </div>
 
@@ -357,7 +358,8 @@
       pageCount: 0,
       breakAfter: new Set(),
       ranges: [],
-      baseName: 'document'
+      baseName: 'document',
+      downloadUrl: null
     };
 
     const el = id => document.getElementById(id);
@@ -366,6 +368,7 @@
     const dropUploadBtn = el('dropUploadBtn');
     const clearBtn = el('clearBtn');
     const downloadBtn = el('downloadBtn');
+    const manualDownloadLink = el('manualDownloadLink');
     const paginateBtn = el('paginateBtn');
     const everyPageBtn = el('everyPageBtn');
     const resetBreaksBtn = el('resetBreaksBtn');
@@ -411,6 +414,10 @@
       state.files = validFiles;
       state.breakAfter = new Set();
       state.ranges = [];
+      if (state.downloadUrl) URL.revokeObjectURL(state.downloadUrl);
+      state.downloadUrl = null;
+      manualDownloadLink.removeAttribute('href');
+      manualDownloadLink.style.display = 'none';
       try {
         await rebuildMergedPdf({ resetSplits: true });
         toast(`${validFiles.length} PDF${validFiles.length === 1 ? '' : 's'} merged successfully.`, 'success');
@@ -673,7 +680,27 @@
 
     async function downloadZip() {
       if (!state.bytes || !state.ranges.length) return;
+
+      // showSaveFilePicker must be called while the original click still has
+      // user activation. Calling it after PDF/ZIP generation can be blocked.
+      let saveHandle = null;
+      if ('showSaveFilePicker' in window && window.isSecureContext) {
+        try {
+          saveHandle = await window.showSaveFilePicker({
+            suggestedName: `${state.baseName}-split.zip`,
+            types: [{
+              description: 'ZIP archive',
+              accept: { 'application/zip': ['.zip'] }
+            }]
+          });
+        } catch (error) {
+          if (error && error.name === 'AbortError') return;
+          console.warn('Native save picker unavailable; using browser download fallback.', error);
+        }
+      }
+
       downloadBtn.disabled = true;
+      manualDownloadLink.style.display = 'none';
       const originalText = downloadBtn.textContent;
       downloadBtn.textContent = 'Building ZIP…';
 
@@ -695,9 +722,28 @@
 
         const sources = state.sourceInfo.map((item, i) => `${i + 1}. ${item.file.name} (merged pages ${item.start}-${item.end})`).join('\n');
         zip.file('README.txt', `Created with PDF Splitter\nMerged source files:\n${sources}\n\nGenerated files: ${state.ranges.length}\nPage ranges: ${rangeInput.value}\n`);
-        const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
-        triggerDownload(blob, `${state.baseName}-split.zip`);
-        toast('ZIP download created successfully.', 'success');
+        const zipBytes = await zip.generateAsync({
+          type: 'uint8array',
+          compression: 'DEFLATE',
+          compressionOptions: { level: 6 },
+          streamFiles: true
+        });
+        const blob = new Blob([zipBytes], { type: 'application/zip' });
+        if (!blob.size) throw new Error('Generated ZIP is empty.');
+        const filename = `${state.baseName}-split.zip`;
+
+        if (saveHandle) {
+          const writable = await saveHandle.createWritable();
+          await writable.write(blob);
+          await writable.close();
+          toast('ZIP saved successfully.', 'success');
+        } else {
+          prepareManualDownload(blob, filename);
+          // Attempt the conventional browser download as a convenience. If
+          // blocked, the persistent Save generated ZIP link remains clickable.
+          manualDownloadLink.click();
+          toast('ZIP is ready. If it did not start automatically, click “Save generated ZIP”.', 'success');
+        }
       } catch (error) {
         console.error(error);
         toast('The split files could not be generated. Try a smaller or unprotected PDF.', 'error');
@@ -734,6 +780,10 @@
       state.pageCount = 0;
       state.breakAfter.clear();
       state.ranges = [];
+      if (state.downloadUrl) URL.revokeObjectURL(state.downloadUrl);
+      state.downloadUrl = null;
+      manualDownloadLink.removeAttribute('href');
+      manualDownloadLink.style.display = 'none';
       fileInput.value = '';
       el('fileName').textContent = 'No PDFs uploaded';
       el('fileDetail').textContent = 'Choose one or more files to begin. Nothing is uploaded to a server.';
@@ -763,15 +813,12 @@
       });
     }
 
-    function triggerDownload(blob, filename) {
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement('a');
-      anchor.href = url;
-      anchor.download = filename;
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 1500);
+    function prepareManualDownload(blob, filename) {
+      if (state.downloadUrl) URL.revokeObjectURL(state.downloadUrl);
+      state.downloadUrl = URL.createObjectURL(blob);
+      manualDownloadLink.href = state.downloadUrl;
+      manualDownloadLink.download = filename;
+      manualDownloadLink.style.display = 'inline-flex';
     }
 
     function toast(message, type = '') {
